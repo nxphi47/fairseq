@@ -18,6 +18,7 @@ from .linearized_convolution import LinearizedConvolution
 from .multihead_attention import MultiheadAttention
 from .scalar_bias import ScalarBias
 from .sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
+from .dptree_multihead_attention import DPTreeMultiheadAttention
 
 __all__ = [
     'AdaptiveInput',
@@ -33,4 +34,6 @@ __all__ = [
     'MultiheadAttention',
     'ScalarBias',
     'SinusoidalPositionalEmbedding',
+    'dptree_multihead_attention',
+    'DPTreeMultiheadAttention',
 ]

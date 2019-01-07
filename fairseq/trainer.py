@@ -71,7 +71,6 @@ class Trainer(object):
         self.meters['wall'] = TimeMeter()      # wall time in seconds
         self.meters['train_wall'] = StopwatchMeter()  # train wall time in seconds
 
-
     @property
     def model(self):
         if self._wrapped_model is None:

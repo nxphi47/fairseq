@@ -16,3 +16,4 @@ import fairseq.modules
 import fairseq.optim
 import fairseq.optim.lr_scheduler
 import fairseq.tasks
+import fairseq.dptree
