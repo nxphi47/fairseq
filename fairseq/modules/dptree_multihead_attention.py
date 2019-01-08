@@ -33,6 +33,12 @@ class DPTreeMultiheadAttention(nn.Module):
         `attn_mask` argument. Padding elements can be excluded from
         the key by passing a binary ByteTensor (`key_padding_mask`) with shape:
         batch x src_len, where padding elements are indicated by 1s.
+
+        :param query:   [Tq, B, C]
+        :param key:     [Tk, B, C]
+        :param value:   [Tk, B, C]
+        :param indices: [Tk, B, 2]
+        :param key_padding_mask:    [B, Tk]
         """
         # TODO: to do in multihead_attention.py
         raise NotImplementedError

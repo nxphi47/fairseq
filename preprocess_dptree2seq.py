@@ -15,9 +15,9 @@ from itertools import zip_longest
 import os
 import shutil
 
-
 from fairseq.data import indexed_dataset, dictionary
 from fairseq.tokenizer import Tokenizer, tokenize_line
+from fairseq.dptree_tokenizer import DPTreeTokenizer
 from multiprocessing import Pool, Manager, Process
 
 
@@ -65,7 +65,7 @@ def get_parser():
     return parser
 
 
-def main(args):
+def main_backup(args):
     print(args)
     os.makedirs(args.destdir, exist_ok=True)
     target = not args.only_source
@@ -256,18 +256,18 @@ def main(args):
             align_dict[srcidx] = max(freq_map[srcidx], key=freq_map[srcidx].get)
 
         with open(
-            os.path.join(
-                args.destdir,
-                "alignment.{}-{}.txt".format(args.source_lang, args.target_lang),
-            ),
-            "w",
+                os.path.join(
+                    args.destdir,
+                    "alignment.{}-{}.txt".format(args.source_lang, args.target_lang),
+                ),
+                "w",
         ) as f:
             for k, v in align_dict.items():
                 print("{} {}".format(src_dict[k], tgt_dict[v]), file=f)
 
 
 def build_and_save_dictionary(
-    train_path, output_path, num_workers, freq_threshold, max_words
+        train_path, output_path, num_workers, freq_threshold, max_words
 ):
     dict = build_dictionary([train_path], num_workers)
     dict.finalize(threshold=freq_threshold, nwords=max_words)
@@ -327,6 +327,349 @@ def merge_files(files, outpath):
         os.remove(indexed_dataset.index_file_path(file))
     ds.finalize("{}.idx".format(outpath))
 
+
+# TODO:-------------------- dptree2seq functions!-------------------------------------
+
+
+def dataset_dest_prefix_dptree(args, output_prefix, lang, modality):
+    assert lang is not None
+    base = f"{args.destdir}/{output_prefix}"
+    lang_part = (
+        f".{args.source_lang}-{args.target_lang}.{lang}.{modality}" if lang is not None else ""
+    )
+    return f"{base}{lang_part}"
+
+
+def dataset_dest_file_dptree(args, output_prefix, lang, extension, modality):
+    base = dataset_dest_prefix_dptree(args, output_prefix, lang, modality)
+    return f"{base}.{extension}"
+
+DPTREE_KEYS = ['nodes', 'labels', 'indices', 'length']
+def binarize_dptree(args, filename, dict, output_prefix, lang, offset, end):
+    ds_keys = DPTREE_KEYS
+    dss = {
+        k: indexed_dataset.IndexedDatasetBuilder(
+            dataset_dest_file_dptree(args, output_prefix, lang, 'bin', k))
+        for k in ds_keys
+    }
+
+    def consumer(example):
+        # ds.add_item(tensor)
+        for k, v in example.items():
+            dss[k].add_item(v)
+
+    res = DPTreeTokenizer.binarize(filename, dict, consumer, offset=offset, end=end)
+    for k, ds in dss.items():
+        ds.finalize(dataset_dest_file_dptree(args, output_prefix, lang, "idx", k))
+
+    return res
+
+
+def main(args):
+    print(args)
+    os.makedirs(args.destdir, exist_ok=True)
+    target = not args.only_source
+
+    def train_path(lang):
+        return "{}{}".format(args.trainpref, ("." + lang) if lang else "")
+
+    def file_name(prefix, lang):
+        fname = prefix
+        if lang is not None:
+            fname += ".{lang}".format(lang=lang)
+        return fname
+
+    def dest_path(prefix, lang):
+        return os.path.join(args.destdir, file_name(prefix, lang))
+
+    def dict_path(lang):
+        return dest_path("dict", lang) + ".txt"
+
+    if args.joined_dictionary:
+        assert not args.srcdict, "cannot combine --srcdict and --joined-dictionary"
+        assert not args.tgtdict, "cannot combine --tgtdict and --joined-dictionary"
+        src_dict = build_dictionary(
+            {train_path(lang) for lang in [args.source_lang, args.target_lang]},
+            args.workers,
+        )
+        tgt_dict = src_dict
+    else:
+        if args.srcdict:
+            src_dict = dictionary.Dictionary.load(args.srcdict)
+        else:
+            assert (
+                args.trainpref
+            ), "--trainpref must be set if --srcdict is not specified"
+            src_dict = build_dictionary([train_path(args.source_lang)], args.workers)
+        if target:
+            if args.tgtdict:
+                tgt_dict = dictionary.Dictionary.load(args.tgtdict)
+            else:
+                assert (
+                    args.trainpref
+                ), "--trainpref must be set if --tgtdict is not specified"
+                tgt_dict = build_dictionary(
+                    [train_path(args.target_lang)], args.workers
+                )
+
+    src_dict.finalize(
+        threshold=args.thresholdsrc,
+        nwords=args.nwordssrc,
+        padding_factor=args.padding_factor,
+    )
+    src_dict.save(dict_path(args.source_lang))
+    if target:
+        if not args.joined_dictionary:
+            tgt_dict.finalize(
+                threshold=args.thresholdtgt,
+                nwords=args.nwordstgt,
+                padding_factor=args.padding_factor,
+            )
+        tgt_dict.save(dict_path(args.target_lang))
+
+    def make_binary_dataset(input_prefix, output_prefix, lang, num_workers):
+        dict = dictionary.Dictionary.load(dict_path(lang))
+        print("| [{}] Dictionary: {} types".format(lang, len(dict) - 1))
+        n_seq_tok = [0, 0]
+        replaced = Counter()
+
+        def merge_result(worker_result):
+            replaced.update(worker_result["replaced"])
+            n_seq_tok[0] += worker_result["nseq"]
+            n_seq_tok[1] += worker_result["ntok"]
+
+        input_file = "{}{}".format(
+            input_prefix, ("." + lang) if lang is not None else ""
+        )
+        offsets = Tokenizer.find_offsets(input_file, num_workers)
+        pool = None
+        if num_workers > 1:
+            pool = Pool(processes=num_workers - 1)
+            for worker_id in range(1, num_workers):
+                prefix = "{}{}".format(output_prefix, worker_id)
+                pool.apply_async(
+                    binarize,
+                    (
+                        args,
+                        input_file,
+                        dict,
+                        prefix,
+                        lang,
+                        offsets[worker_id],
+                        offsets[worker_id + 1],
+                    ),
+                    callback=merge_result,
+                )
+            pool.close()
+
+        ds = indexed_dataset.IndexedDatasetBuilder(
+            dataset_dest_file(args, output_prefix, lang, "bin")
+        )
+        merge_result(
+            Tokenizer.binarize(
+                input_file, dict, lambda t: ds.add_item(t), offset=0, end=offsets[1]
+            )
+        )
+        if num_workers > 1:
+            pool.join()
+            for worker_id in range(1, num_workers):
+                prefix = "{}{}".format(output_prefix, worker_id)
+                temp_file_path = dataset_dest_prefix(args, prefix, lang)
+                ds.merge_file_(temp_file_path)
+                os.remove(indexed_dataset.data_file_path(temp_file_path))
+                os.remove(indexed_dataset.index_file_path(temp_file_path))
+
+        ds.finalize(dataset_dest_file(args, output_prefix, lang, "idx"))
+
+        print(
+            "| [{}] {}: {} sents, {} tokens, {:.3}% replaced by {}".format(
+                lang,
+                input_file,
+                n_seq_tok[0],
+                n_seq_tok[1],
+                100 * sum(replaced.values()) / n_seq_tok[1],
+                dict.unk_word,
+            )
+        )
+
+    def make_binary_dptree_dataset(input_prefix, output_prefix, lang, num_workers):
+        dict = dictionary.Dictionary.load(dict_path(lang))
+        print("| [{}] Dictionary: {} types".format(lang, len(dict) - 1))
+        n_seq_tok = [0, 0]
+        replaced = Counter()
+
+        def merge_result(worker_result):
+            replaced.update(worker_result["replaced"])
+            n_seq_tok[0] += worker_result["nseq"]
+            n_seq_tok[1] += worker_result["ntok"]
+
+        input_file = "{}{}".format(
+            input_prefix, ("." + lang) if lang is not None else ""
+        )
+        offsets = Tokenizer.find_offsets(input_file, num_workers)
+        pool = None
+        if num_workers > 1:
+            pool = Pool(processes=num_workers - 1)
+            for worker_id in range(1, num_workers):
+                prefix = "{}{}".format(output_prefix, worker_id)
+                pool.apply_async(
+                    binarize_dptree,
+                    (
+                        args,
+                        input_file,
+                        dict,
+                        prefix,
+                        lang,
+                        offsets[worker_id],
+                        offsets[worker_id + 1],
+                    ),
+                    callback=merge_result,
+                )
+            pool.close()
+
+        dss = {
+            modality: indexed_dataset.IndexedDatasetBuilder(
+                dataset_dest_file_dptree(args, output_prefix, lang, 'bin', modality))
+            for modality in DPTREE_KEYS
+        }
+
+        def consumer(example):
+            # ds.add_item(tensor)
+            for modality, tensor in example.items():
+                dss[modality].add_item(tensor)
+
+        merge_result(
+            DPTreeTokenizer.binarize(
+                input_file, dict, consumer, offset=0, end=offsets[1]
+            )
+        )
+
+        if num_workers > 1:
+            pool.join()
+            for worker_id in range(1, num_workers):
+                prefix = "{}{}".format(output_prefix, worker_id)
+                for modality, ds in dss.items():
+                    temp_file_path = dataset_dest_prefix_dptree(args, prefix, lang, modality)
+                    ds.merge_file_(temp_file_path)
+                    os.remove(indexed_dataset.data_file_path(temp_file_path))
+                    os.remove(indexed_dataset.index_file_path(temp_file_path))
+
+        for modality, ds in dss.items():
+            ds.finalize(dataset_dest_file_dptree(args, output_prefix, lang, "idx", modality))
+
+        print(
+            "| [{}] {}: {} sents, {} tokens, {:.3}% replaced by {}".format(
+                lang,
+                input_file,
+                n_seq_tok[0],
+                n_seq_tok[1],
+                100 * sum(replaced.values()) / n_seq_tok[1],
+                dict.unk_word,
+            )
+        )
+
+    def make_dataset(input_prefix, output_prefix, lang, num_workers=1):
+        if args.output_format == "binary":
+            make_binary_dataset(input_prefix, output_prefix, lang, num_workers)
+        elif args.output_format == "raw":
+            # Copy original text file to destination folder
+            output_text_file = dest_path(
+                output_prefix + ".{}-{}".format(args.source_lang, args.target_lang),
+                lang,
+            )
+            shutil.copyfile(file_name(input_prefix, lang), output_text_file)
+
+    def make_dptree_dataset(input_prefix, output_prefix, lang, num_workers=1):
+        if args.output_format != "binary":
+            raise NotImplementedError(f'output format {args.output_format} not impl')
+        make_binary_dptree_dataset(input_prefix, output_prefix, lang, num_workers)
+
+    def make_all(lang):
+        if args.trainpref:
+            make_dataset(args.trainpref, "train", lang, num_workers=args.workers)
+        if args.validpref:
+            for k, validpref in enumerate(args.validpref.split(",")):
+                outprefix = "valid{}".format(k) if k > 0 else "valid"
+                make_dataset(validpref, outprefix, lang)
+        if args.testpref:
+            for k, testpref in enumerate(args.testpref.split(",")):
+                outprefix = "test{}".format(k) if k > 0 else "test"
+                make_dataset(testpref, outprefix, lang)
+
+    def make_all_src(lang):
+        if args.trainpref:
+            make_dptree_dataset(args.trainpref, "train", lang, num_workers=args.workers)
+        if args.validpref:
+            for k, validpref in enumerate(args.validpref.split(",")):
+                outprefix = "valid{}".format(k) if k > 0 else "valid"
+                make_dptree_dataset(validpref, outprefix, lang)
+        if args.testpref:
+            for k, testpref in enumerate(args.testpref.split(",")):
+                outprefix = "test{}".format(k) if k > 0 else "test"
+                make_dptree_dataset(testpref, outprefix, lang)
+
+    def make_all_tgt(lang):
+        make_all(lang)
+
+    make_all_src(args.source_lang)
+    if target:
+        make_all_tgt(args.target_lang)
+
+    print("| Wrote preprocessed data to {}".format(args.destdir))
+
+    if args.alignfile:
+        assert args.trainpref, "--trainpref must be set if --alignfile is specified"
+        src_file_name = train_path(args.source_lang)
+        tgt_file_name = train_path(args.target_lang)
+        src_dict = dictionary.Dictionary.load(dict_path(args.source_lang))
+        tgt_dict = dictionary.Dictionary.load(dict_path(args.target_lang))
+        freq_map = {}
+        with open(args.alignfile, "r") as align_file:
+            with open(src_file_name, "r") as src_file:
+                with open(tgt_file_name, "r") as tgt_file:
+                    for a, s, t in zip_longest(align_file, src_file, tgt_file):
+                        si = Tokenizer.tokenize(s, src_dict, add_if_not_exist=False)
+                        ti = Tokenizer.tokenize(t, tgt_dict, add_if_not_exist=False)
+                        ai = list(map(lambda x: tuple(x.split("-")), a.split()))
+                        for sai, tai in ai:
+                            srcidx = si[int(sai)]
+                            tgtidx = ti[int(tai)]
+                            if srcidx != src_dict.unk() and tgtidx != tgt_dict.unk():
+                                assert srcidx != src_dict.pad()
+                                assert srcidx != src_dict.eos()
+                                assert tgtidx != tgt_dict.pad()
+                                assert tgtidx != tgt_dict.eos()
+
+                                if srcidx not in freq_map:
+                                    freq_map[srcidx] = {}
+                                if tgtidx not in freq_map[srcidx]:
+                                    freq_map[srcidx][tgtidx] = 1
+                                else:
+                                    freq_map[srcidx][tgtidx] += 1
+
+        align_dict = {}
+        for srcidx in freq_map.keys():
+            align_dict[srcidx] = max(freq_map[srcidx], key=freq_map[srcidx].get)
+
+        with open(
+                os.path.join(
+                    args.destdir,
+                    "alignment.{}-{}.txt".format(args.source_lang, args.target_lang),
+                ),
+                "w",
+        ) as f:
+            for k, v in align_dict.items():
+                print("{} {}".format(src_dict[k], tgt_dict[v]), file=f)
+
+
+
+"""
+TEXT=examples/translation/iwslt14.tokenized.de-en
+python preprocess.py --source-lang de --target-lang en \
+    --trainpref $TEXT/train --validpref $TEXT/valid --testpref $TEXT/test \
+    --destdir data-bin/iwslt14.tokenized.de-en
+
+"""
 
 if __name__ == "__main__":
     parser = get_parser()

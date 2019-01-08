@@ -66,16 +66,30 @@ class DPTreeTokenizer(object):
             reverse_order=reverse_order,
         )
 
-        tree_length = len(line_node)
+        # tree_length = len(line_node)
         line_length = len(line_leaves)
 
         # line_node += [0]
         # line_label += [0]
         # line_index += [[line_length, line_length]]
 
-        # TODO: add ides
-        node_indices = torch.cat(node_indices, torch.tensor([]))
+        # TODO: add pads
+        # FIXME: MUST CHECK pad_index = 1 systematically!
+        pad_index = 1
+        node_indices = torch.cat([node_indices, torch.tensor([pad_index]).int()], 0)
+        labels_indices = torch.cat([labels_indices, torch.tensor([pad_index]).int()], 0)
+        line_index += [[line_length, line_length]]
 
+        line_indices = torch.tensor(line_index).int()
+        line_len = torch.tensor([line_indices]).int()
+
+        example = {
+            "nodes": node_indices,
+            "labels": labels_indices,
+            "indices": line_indices,
+            "length": line_len
+        }
+        return example
 
     @staticmethod
     def add_file_to_dictionary_single_worker(filename, tokenize, eos_word, worker_id=0, num_workers=1):
@@ -121,7 +135,7 @@ class DPTreeTokenizer(object):
 
     @staticmethod
     def binarize(filename, dict, consumer, tokenize=tokenize_line,
-                 append_eos=True, reverse_order=False,
+                 append_eos=False, reverse_order=False,
                  offset=0, end=-1):
         nseq, ntok = 0, 0
         replaced = Counter()
@@ -137,19 +151,28 @@ class DPTreeTokenizer(object):
             while line:
                 if end > 0 and f.tell() > end:
                     break
-                asdasd
-                ids = DPTreeTokenizer.tokenize(
-                    line=line,
-                    dict=dict,
-                    tokenize=tokenize,
-                    add_if_not_exist=False,
+                # asdasd
+                # ids = DPTreeTokenizer.tokenize(
+                #     line=line,
+                #     dict=dict,
+                #     tokenize=tokenize,
+                #     add_if_not_exist=False,
+                #     consumer=replaced_consumer,
+                #     append_eos=append_eos,
+                #     reverse_order=reverse_order,
+                # )
+                example = DPTreeTokenizer.line2example(
+                    s=line,
                     consumer=replaced_consumer,
+                    tokenize=tokenize,
                     append_eos=append_eos,
                     reverse_order=reverse_order,
+                    offset=offset,
+                    end=end
                 )
                 nseq += 1
-                ntok += len(ids)
-                consumer(ids)
+                ntok += len(example['nodes'])
+                consumer(example)
                 line = f.readline()
         return {'nseq': nseq, 'nunk': sum(replaced.values()), 'ntok': ntok, 'replaced': replaced}
 
